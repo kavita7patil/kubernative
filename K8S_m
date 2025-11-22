@@ -1,154 +1,107 @@
 #!/bin/bash
-kubeconfig_path=''
-function unkown_option() {
-echo -e "\nUnknown K8S node type: $1 \n"; 
-echo "--------------------------------------------------------------------------"
-echo "    Preffered Ubuntu 20.04_LTS or above with bellow requirements"
-echo "------------------------------ Master setup ------------------------------"
-echo "    Minimum requirement - 2GB RAM & 2Core CPU" 
-echo "    k8s_install.sh master"
-echo "------------------------------ Worker setup ------------------------------"
-echo "    Minimum requirement - Any"
-echo "    k8s_install.sh worker"
-echo "--------------------------------------------------------------------------"
+# K8S Installer Script (Master / Worker)
+# Tested on Ubuntu 20.04+
+
+kubeconfig_path="$HOME"
+
+function unknown_option() {
+    echo -e "\nUnknown K8S node type: $1 \n"
+    echo "--------------------------------------------------------------------------"
+    echo "Preferred Ubuntu 20.04_LTS or above"
+    echo "------------------------------ Master setup ------------------------------"
+    echo "  Minimum requirement - 2GB RAM & 2 Core CPU" 
+    echo "  Usage: ./k8s_install.sh master"
+    echo "------------------------------ Worker setup ------------------------------"
+    echo "  Minimum requirement - Any"
+    echo "  Usage: ./k8s_install.sh worker"
+    echo "--------------------------------------------------------------------------"
 }
 
-# Check if the machine Linux and Distor is Ubuntu or RHEL(RedHat)
-UNAME=$(uname | tr "[:upper:]" "[:lower:]")
-# If Linux, try to determine specific distribution
-if [ "$UNAME" == "linux" ]; then
-    # If available, use LSB to identify distribution
-    if [ -f /etc/lsb-release -o -d /etc/lsb-release.d ]; then
-        kubeconfig_path='/home/ubuntu' 
-    elif [[ -f /etc/redhat-release ]]; then
-        kubeconfig_path='/home/ec2-user'
-    else 
-        echo -e "   Linux is not either Ubuntu nor RHEL.... \n"; 
-        unkown_option
-        exit 1; 
-    fi  
-else 
-    echo -e "    Not a Linux platform ... \n"; 
-    unkown_option
-    exit 1; 
-fi
+# Show help
+[[ "$1" == "--help" || "$1" == "help" || "$1" == "-h" ]] && { unknown_option; exit 0; }
 
-[[ "$1" == "--help" || "$1" == "help" || "$1" == "-h" ]] && { unkown_option; exit 0;}
-
+# Validate argument
 if [[ "$1" == 'master' ]]; then 
-echo -e "\n-------------------------- K8S Master node setup --------------------------"
+    NODE_TYPE="master"
+    echo -e "\n-------------------------- K8S Master node setup --------------------------"
 elif [[ "$1" == 'worker' ]]; then 
-echo -e "\n-------------------------- K8S Worker node setup --------------------------"
+    NODE_TYPE="worker"
+    echo -e "\n-------------------------- K8S Worker node setup --------------------------"
 else 
-unkown_option $1
-exit 1
+    unknown_option $1
+    exit 1
 fi
 
-echo -e "\n-------------------------- Updating OS and Base configuration--------------------------\n"
-sudo apt update
+# Update OS and disable swap
+echo -e "\n-------------------------- Updating OS and disabling swap --------------------------\n"
+sudo apt update -y
 sudo swapoff -a
-sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+sudo sed -i '/ swap / s/^/#/' /etc/fstab
+
+# Load kernel modules and sysctl
 sudo tee /etc/modules-load.d/containerd.conf <<EOF
 overlay
 br_netfilter
 EOF
 sudo modprobe overlay
 sudo modprobe br_netfilter
+
 sudo tee /etc/sysctl.d/kubernetes.conf <<EOF
 net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
 EOF
 sudo sysctl --system
-echo -e "\n-------------------------- APT transport for downloading pkgs via HTTPS --------------------------\n"
-sudo apt-get update
-sudo apt-get install -y gnupg2 gpg software-properties-common apt-transport-https ca-certificates curl 
 
-echo -e "\n-------------------------- Enable the Docker repository --------------------------\n"
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmour -o /etc/apt/trusted.gpg.d/docker.gpg
-sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+# Install base packages
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release software-properties-common
 
+# Install containerd
+echo -e "\n-------------------------- Installing containerd --------------------------\n"
+sudo apt install -y containerd
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
 
-sudo su - <<EOF
-echo -e "\n-------------------------- Install container.io --------------------------\n"
-apt update
-apt install -y containerd.io
-containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
-sudo sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
-systemctl stop containerd
-systemctl start containerd
-systemctl enable containerd
-EOF
-
-sudo su - <<EOF
-echo -e "\n--------------------------  Adding K8S packgaes to APT list --------------------------\n"
-[[ -d "/etc/apt/keyrings" ]] || mkdir -p /etc/apt/keyrings
+# Install kubernetes packages
+echo -e "\n-------------------------- Installing kubeadm, kubelet, kubectl --------------------------\n"
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
-EOF
-
-
-echo -e "\n-------------------------- Install kubeadm, kubelet, kubectl and kubernetes-cni --------------------------\n"
 sudo apt update -y
 sudo apt install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 
-echo -e "\n-------------------------- Install extended tool for k8s - stern, kubetcx --------------------------\n"
+# Optional tools
+echo -e "\n-------------------------- Installing stern and kubectx --------------------------\n"
 curl -s -Lo /tmp/stern.tar.gz https://github.com/stern/stern/releases/download/v1.24.0/stern_1.24.0_linux_amd64.tar.gz
 tar -xvzf /tmp/stern.tar.gz -C /tmp
 sudo mv /tmp/stern /usr/local/bin/
 sudo apt install -y kubectx
 
+# Master node setup
+if [[ "$NODE_TYPE" == "master" ]]; then
+    echo -e "\n-------------------------- Initializing K8S Master --------------------------\n"
+    sudo kubeadm init --pod-network-cidr=192.168.0.0/16
 
-if [[ "$1" == 'master' ]]; then 
-echo -e "\n-------------------------- Initiating kubeadm control-plane (master node) --------------------------\n"
-sudo su - <<EOF
-kubeadm init
-EOF
-echo "--------------------------------------------------------------------------"
-echo "       Save the above kubeadm join <token> command to run on worker node"
-echo "--------------------------------------------------------------------------"
+    # Setup kubectl for the current user
+    mkdir -p $kubeconfig_path/.kube
+    sudo cp -i /etc/kubernetes/admin.conf $kubeconfig_path/.kube/config
+    sudo chown $(id -u):$(id -g) $kubeconfig_path/.kube/config
 
-echo -e "\n-------------------------- Copy the join <token> command --------------------------\n" 
-echo "    The join command must be executed in the worker node that we intend to add to the control-plane."
-echo "      1. Better save the join command in a seperate file for future use"
-echo "      2. If the join command is lost, we can generate it using bellow command:"  
-echo "            kubeadm token create --print-join-command"
-echo -e "\n-----------------------------------------------------------------------------------\n"
+    echo -e "\n-------------------------- Install Calico network plugin --------------------------\n"
+    kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
 
-echo -e "\n-------------------------- Setiing-up Kubectl config  --------------------------\n"
-sleep 10
-mkdir -p $HOME/.kube
-if [[ -f "/etc/kubernetes/admin.conf" ]]; then 
-    sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config 
-    sudo chown $(id -u):$(id -g) $HOME/.kube/config
-else 
-    echo '/etc/kubernetes/admin.conf Not found'
+    echo -e "\n-------------------------- Master node status --------------------------\n"
+    kubectl get nodes
+    echo -e "\nSave the kubeadm join command above to add worker nodes."
 fi
-[[ -f "$HOME/.kube/config" ]] || echo "     Kubeconfig copied $HOME/.kube/config"
 
-echo -e "\n-------------------------- Install calico/weaveworks networking and network policy plugin --------------------------\n"
-#kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
-#kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml
-kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml 
-
-echo -e "\n---------------------------------- Checking mater node status ---------------------------\n"
-kubectl get nodes
-echo -e "\n Waiting to control-plane (master node) to get Ready ...........\n"
-sleep 15
-kubectl get nodes
-echo -e "\n\n  Wait to for 5-10 minutes, if node is still not in Ready state then try to install below calico network cni "
-echo "    1. kubectl apply -f https://docs.projectcalico.org/manifests/calico-typha.yaml"
-echo "    2. kubectl get nodes"
-echo -e "\n-----------------------------------------------------------------------------------"
-
-fi  
-
-if [[ "$1" == 'worker' ]]; then 
-echo "------------------------------------------------------------------------------------"
-echo "    1. switch to root user: sudo su -"
-echo "    2. Allow incoming traffic to port 6443 in control-plane (master node)" 
-echo "    3. Run the kubeadm join <TOKEN> command which we get from master"
-echo "    4. Run 'kubectl get nodes' on the control-plane to see this node joined the cluster."
-echo "------------------------------------------------------------------------------------"
+# Worker node instructions
+if [[ "$NODE_TYPE" == "worker" ]]; then
+    echo -e "\n-------------------------- Worker Node Setup --------------------------\n"
+    echo "1. Run this script with 'master' on the control-plane to get join command"
+    echo "2. On worker node, execute: sudo kubeadm join <token-from-master> --discovery-token-ca-cert-hash sha256:<hash>"
+    echo "3. Verify on master: kubectl get nodes"
 fi
